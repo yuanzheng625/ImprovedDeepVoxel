@@ -137,5 +137,5 @@ dependencies:
     - protobuf==3.6.1
     - tensorboardx==1.5
     - torch==1.0.0
-prefix: /home/sitzmann/miniconda3/envs/deepvoxels
+prefix: /export/home/miniconda/envs/deepvoxels
 

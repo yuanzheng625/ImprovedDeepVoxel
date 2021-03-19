@@ -82,6 +82,29 @@ class ProjectionHelper:
         bbox_max = torch.max(bbox_max0, bbox_max1)
         return bbox_min, bbox_max, pl
 
+    def compute_view_bounds_in_scene(self, input_image_intrinsic, depth_map, camera_to_world, world_to_grid):
+        # suppose know depth map, can calculate the real 3d position from this image
+        # so we can get 3d bounding box from this view, but with aggregate all views, get better 3d bounding box
+        v, u = np.mgrid[:512, :512]
+        cx = input_image_intrinsic[0][2]
+        cy = input_image_intrinsic[1][2]
+        f = input_image_intrinsic[0][0]
+        x_cam = depth_map * (u - cx) / f
+        y_cam = depth_map * (v - cy) / f
+        cam_coords = np.stack((x_cam, y_cam, depth_map, np.ones_like(depth_map)), axis=-1)
+
+        cam_coords = cam_coords[depth_map != 1]
+
+        world_coords = np.matmul(camera_to_world, cam_coords.reshape(-1, 4, 1)).squeeze()
+
+        # grid coords
+        grid_metric = np.matmul(world_to_grid, world_coords.reshape(-1, 4, 1)).squeeze()
+
+        view_min = np.min(grid_metric, axis=0)
+        view_max = np.max(grid_metric, axis=0)
+
+        return view_min, view_max
+
     def comp_lifting_idcs(self, camera_to_world, grid2world):
         world2cam = torch.inverse(camera_to_world)
         world2grid = torch.inverse(grid2world)
@@ -169,6 +192,89 @@ class ProjectionHelper:
 
         return final_lin_ind, interpolation_coordinates
 
+    def comp_tighter_lifting_idcs(self, scene_min, scene_max, input_image_intrinsic, depth_map,
+                                  camera_to_world, grid2world):
+        world2cam = torch.inverse(camera_to_world)
+        world2grid = torch.inverse(grid2world)
+
+        # Voxel bounds are computed in the grid coordinate system (grid at origin)
+        voxel_bounds_min, voxel_bounds_max = self.compute_view_bounds_in_scene(input_image_intrinsic,
+                                                                               depth_map,
+                                                                               camera_to_world,
+                                                                               world2grid)
+
+        x_len = scene_max[0] - scene_min[0]
+        y_len = scene_max[1] - scene_min[1]
+        z_len = scene_max[2] - scene_min[2]
+        volume = x_len * y_len * z_len
+        voxel_volume = volume / (32 * 32 * 32)  # equal amount of voxels -> equal complexity
+        voxel_size = np.cbrt(voxel_volume)
+
+        x = np.arange(scene_min[0], scene_max[0], voxel_size)
+        y = np.arange(scene_min[1], scene_max[1], voxel_size)
+        z = np.arange(scene_min[2], scene_max[2], voxel_size)
+
+        voxels_x, voxels_y, voxels_z = np.meshgrid(x, y, z)
+
+        num_voxels = voxels_x.shape[0]
+
+        lin_ind_volume = np.arange(0, num_voxels)
+
+        # should have nearly 32*32*32 coords
+        coords = np.hstack([voxels_x.flatten(), voxels_y.flatten(),
+                            voxels_z.flatten(), np.ones_like(voxels_x.flatten())])
+
+        mask = coords[0, :] >= voxel_bounds_min[0]
+        coords = coords[:, mask]
+        lin_ind_volume = lin_ind_volume[mask]
+        mask = coords[0, :] <= voxel_bounds_max[0]
+        coords = coords[:, mask]
+        lin_ind_volume = lin_ind_volume[mask]
+        mask = coords[1, :] >= voxel_bounds_min[1]
+        coords = coords[:, mask]
+        lin_ind_volume = lin_ind_volume[mask]
+        mask = coords[1, :] <= voxel_bounds_max[1]
+        coords = coords[:, mask]
+        lin_ind_volume = lin_ind_volume[mask]
+        mask = coords[2, :] >= voxel_bounds_min[2]
+        coords = coords[:, mask]
+        lin_ind_volume = lin_ind_volume[mask]
+        mask = coords[2, :] <= voxel_bounds_max[2]
+        coords = coords[:, mask]
+        lin_ind_volume = lin_ind_volume[mask]
+
+        if not coords.any():
+            print('error: nothing in frustum bounds')
+            return None
+
+        coords = torch.tensor(coords).to(self.device)
+
+        # transform grid coordinates to current frame
+        p = torch.mm(world2cam, torch.mm(grid2world, coords.float())).to(self.device)
+
+        # project to pixel coordinates
+        p[0] = (p[0] * self.lifting_intrinsic[0][0]) / p[2] + self.lifting_intrinsic[0][2]
+        p[1] = (p[1] * self.lifting_intrinsic[1][1]) / p[2] + self.lifting_intrinsic[1][2]
+        pi = p.round().long()
+
+        # Everything that's out of the image boundaries gets the boot # TODO
+        valid_ind_mask = (torch.ge(pi[0], 0) *
+                          torch.ge(pi[1], 0) *
+                          torch.lt(pi[0], self.lifting_image_dims[0]) *
+                          torch.lt(pi[1], self.lifting_image_dims[1]))
+        if not valid_ind_mask.any():
+            print('error: no valid image indices')
+            return None
+
+        # Update p and the volume indices
+        valid_p = p[:, valid_ind_mask]
+        lin_ind_volume = lin_ind_volume[valid_ind_mask]
+
+        final_lin_ind = lin_ind_volume
+        interpolation_coordinates = valid_p[:3, :]
+
+        return final_lin_ind, interpolation_coordinates
+
     def compute_proj_idcs(self, cam2world, grid2world):
         # Linear index into the frustrum
         # lin_ind_frustrum = torch.arange(0, self.image_dims[0]*self.image_dims[1]*self.grid_dims[2]).long().cuda()
@@ -183,7 +289,7 @@ class ProjectionHelper:
         # Manually compute x-y-z voxel coordinates of volume
         coords[2] = lin_ind_frustrum / (self.projection_image_dims[0] * self.projection_image_dims[1])
         tmp = lin_ind_frustrum - (
-                    coords[2] * self.projection_image_dims[0] * self.projection_image_dims[1]).long().cuda()
+                coords[2] * self.projection_image_dims[0] * self.projection_image_dims[1]).long().cuda()
         coords[1] = tmp / self.projection_image_dims[0]
         coords[0] = torch.remainder(tmp, self.projection_image_dims[0])
         coords[3].fill_(1)

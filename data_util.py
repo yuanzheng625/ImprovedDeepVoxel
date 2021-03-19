@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-import imageio
+#import imageio
 from skimage import io, transform
 from glob import glob
 import os

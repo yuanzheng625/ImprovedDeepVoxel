@@ -67,7 +67,7 @@ input_image_dims = [opt.img_sidelength, opt.img_sidelength]
 proj_image_dims = [64, 64] # Height, width of 2d feature map used for lifting and rendering.
 
 # Read origin of grid, scale of each voxel, and near plane
-_, grid_barycenter, scale, near_plane, _ = \
+input_image_intrinsic, grid_barycenter, scale, near_plane, _ = \
     util.parse_intrinsics(os.path.join(opt.data_root, 'intrinsics.txt'), trgt_sidelength=input_image_dims[0])
 
 if near_plane == 0.0:
@@ -151,7 +151,7 @@ def train():
     train_dataset = NovelViewTriplets(root_dir=opt.data_root,
                                       img_size=input_image_dims,
                                       sampling_pattern=opt.sampling_pattern)
-    dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=8)
+    dataloader = DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=0)
 
     # directory name contains some info about hyperparameters.
     dir_name = os.path.join(datetime.datetime.now().strftime('%m_%d'),
@@ -314,7 +314,7 @@ def test():
     util.custom_load(model, opt.checkpoint)
     model.eval()
 
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
     dir_name = os.path.join(datetime.datetime.now().strftime('%m_%d'),
                             datetime.datetime.now().strftime('%H-%M-%S_') +
